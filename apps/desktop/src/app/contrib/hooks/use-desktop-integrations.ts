@@ -4,14 +4,19 @@ import { isFocusWithin } from '@/lib/keybinds/combo'
 import { storedSessionIdForNotification } from '@/lib/session-ids'
 import { respondToApprovalAction } from '@/store/native-notifications'
 import { $filePreviewTarget, $previewTarget, closeActiveRightRailTab } from '@/store/preview'
-import { getRememberedSessionId, setRememberedSessionId } from '@/store/session'
+import {
+  getRememberedRoute,
+  getRememberedSessionId,
+  setRememberedRoute,
+  setRememberedSessionId
+} from '@/store/session'
 import { onSessionsChanged } from '@/store/session-sync'
 import { openUpdatesWindow, startUpdatePoller, stopUpdatePoller } from '@/store/updates'
 import { isSecondaryWindow } from '@/store/windows'
 
 import { requestComposerFocus, requestComposerInsert } from '../../chat/composer/focus'
 import { closeActiveTerminal } from '../../right-sidebar/terminal/terminals'
-import { NEW_CHAT_ROUTE, sessionRoute } from '../../routes'
+import { appViewForPath, isOverlayView, NEW_CHAT_ROUTE, sessionRoute } from '../../routes'
 
 interface DesktopIntegrationsParams {
   chatOpen: boolean
@@ -59,25 +64,44 @@ export function useDesktopIntegrations({
     window.hermesDesktop?.setPreviewShortcutActive?.(Boolean(chatOpen && hasPreview))
   }, [chatOpen, hasPreview])
 
-  // Remember the open chat so a relaunch reopens it instead of an empty
-  // new-chat; restore once on cold start; a dead id self-clears.
+  // Remember the open chat (session id for notifications/resume) AND the last
+  // non-overlay route (a page like /skills, or a session route) so a relaunch
+  // lands where you were. Overlays (settings/command-center/…) aren't stored —
+  // you don't want to boot into a modal.
   useEffect(() => {
     if (routedSessionId) {
       setRememberedSessionId(routedSessionId)
     }
-  }, [routedSessionId])
 
-  const restoredLastSessionRef = useRef(false)
+    if (!isOverlayView(appViewForPath(locationPathname))) {
+      setRememberedRoute(locationPathname)
+    }
+  }, [locationPathname, routedSessionId])
 
+  const restoredRef = useRef(false)
+
+  // Restore once on cold start — only when the renderer booted at the default
+  // route (a hidden-then-shown window keeps its own route). Prefer the full
+  // remembered route (covers pages); fall back to the last session id.
   useEffect(() => {
-    if (restoredLastSessionRef.current) {
+    if (restoredRef.current || locationPathname !== NEW_CHAT_ROUTE) {
+      restoredRef.current = true
+
       return
     }
 
-    restoredLastSessionRef.current = true
+    restoredRef.current = true
+    const route = getRememberedRoute()
+
+    if (route && route !== NEW_CHAT_ROUTE && !isOverlayView(appViewForPath(route))) {
+      navigate(route, { replace: true })
+
+      return
+    }
+
     const last = getRememberedSessionId()
 
-    if (last && locationPathname === NEW_CHAT_ROUTE) {
+    if (last) {
       navigate(sessionRoute(last), { replace: true })
     }
   }, [locationPathname, navigate])

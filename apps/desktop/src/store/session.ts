@@ -28,6 +28,13 @@ const LAST_SESSION_KEY = 'hermes.desktop.lastSessionId'
 export const getRememberedSessionId = (): null | string => storedString(LAST_SESSION_KEY)
 export const setRememberedSessionId = (id: null | string) => persistString(LAST_SESSION_KEY, id)
 
+// The last non-overlay route (a page like /skills, or a session route), so a
+// relaunch lands back where you were instead of a bare new-chat.
+const LAST_ROUTE_KEY = 'hermes.desktop.lastRoute'
+
+export const getRememberedRoute = (): null | string => storedString(LAST_ROUTE_KEY)
+export const setRememberedRoute = (path: null | string) => persistString(LAST_ROUTE_KEY, path)
+
 let configuredDefaultProjectDir = ''
 
 function workspaceCwdKey(connection: HermesConnection | null = $connection.get()): string {
