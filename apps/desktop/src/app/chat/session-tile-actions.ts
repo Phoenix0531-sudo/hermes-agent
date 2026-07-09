@@ -15,7 +15,7 @@ import { useGatewayRequest } from '@/app/gateway/hooks/use-gateway-request'
 import type { ClientSessionState } from '@/app/types'
 import { PROMPT_SUBMIT_REQUEST_TIMEOUT_MS } from '@/hermes'
 import { useI18n } from '@/i18n'
-import { branchGroupForUser, type ChatMessage, chatMessageText, textPart } from '@/lib/chat-messages'
+import { textPart } from '@/lib/chat-messages'
 import { SLASH_COMMAND_RE } from '@/lib/chat-runtime'
 import { triggerHaptic } from '@/lib/haptics'
 import { clearClarifyRequest } from '@/store/clarify'
@@ -30,14 +30,18 @@ import { clearSessionSubagents } from '@/store/subagents'
 import { clearSessionTodos } from '@/store/todos'
 
 import { uploadComposerAttachment } from '../session/hooks/use-prompt-actions'
-import { useSubmitPrompt } from '../session/hooks/use-prompt-actions/submit'
 import {
-  isSessionBusyError,
-  type SubmitTextOptions,
-  visibleUserIndexAtOrdinal,
-  visibleUserOrdinal,
-  withSessionBusyRetry
-} from '../session/hooks/use-prompt-actions/utils'
+  applyBranchVisibility,
+  applyReloadOptimistic,
+  applyRewindOptimistic,
+  finalizeInterruptedMessages,
+  planEdit,
+  planReload,
+  planRestore,
+  runRewindSubmit
+} from '../session/hooks/use-prompt-actions/rewind'
+import { useSubmitPrompt } from '../session/hooks/use-prompt-actions/submit'
+import { type SubmitTextOptions } from '../session/hooks/use-prompt-actions/utils'
 
 import type { ComposerScope } from './composer/scope'
 
@@ -181,9 +185,7 @@ export function useSessionTileActions({ runtimeId, scope, storedSessionId }: Ses
 
     update(state => ({
       ...state,
-      messages: state.messages
-        .filter(m => !((m.pending || m.id === state.streamId) && !chatMessageText(m).trim()))
-        .map(m => (m.pending || m.id === state.streamId ? { ...m, pending: false } : m)),
+      messages: finalizeInterruptedMessages(state.messages, state.streamId),
       busy: false,
       awaitingResponse: false,
       streamId: null,
@@ -234,41 +236,11 @@ export function useSessionTileActions({ runtimeId, scope, storedSessionId }: Ses
     [appendSystemNote, requestGateway]
   )
 
-  // Rewind primitive shared by edit/reload/restore — the primary's
-  // submitRewindPrompt semantics (interrupt-first for live turns, busy-retry).
+  // Rewind primitive (interrupt-first for live turns, busy-retry) — shared with
+  // the primary chat so the two can't diverge.
   const submitRewind = useCallback(
-    async (text: string, truncateOrdinal: number | undefined, interruptFirst: boolean) => {
-      const sessionId = runtimeIdRef.current
-
-      const interrupt = () =>
-        requestGateway('session.interrupt', { session_id: sessionId }).catch(() => undefined)
-
-      const submit = () =>
-        requestGateway(
-          'prompt.submit',
-          {
-            session_id: sessionId,
-            text,
-            ...(truncateOrdinal !== undefined && { truncate_before_user_ordinal: truncateOrdinal })
-          },
-          PROMPT_SUBMIT_REQUEST_TIMEOUT_MS
-        )
-
-      if (interruptFirst) {
-        await interrupt()
-      }
-
-      try {
-        await submit()
-      } catch (err) {
-        if (!isSessionBusyError(err)) {
-          throw err
-        }
-
-        await interrupt()
-        await withSessionBusyRetry(submit)
-      }
-    },
+    (text: string, truncateOrdinal: number | undefined, interruptFirst: boolean) =>
+      runRewindSubmit(requestGateway, runtimeIdRef.current, text, truncateOrdinal, interruptFirst),
     [requestGateway]
   )
 
@@ -280,56 +252,18 @@ export function useSessionTileActions({ runtimeId, scope, storedSessionId }: Ses
         return
       }
 
-      const messages = state.messages
-      const parentIndex = parentId ? messages.findIndex(m => m.id === parentId) : messages.length - 1
+      const plan = planReload(state.messages, parentId)
 
-      const userBack =
-        parentIndex >= 0 ? [...messages.slice(0, parentIndex + 1)].reverse().findIndex(m => m.role === 'user') : -1
-
-      if (userBack < 0) {
+      if (!plan) {
         return
       }
 
-      const userIndex = parentIndex - userBack
-      const userMessage = messages[userIndex]
-      const userText = userMessage ? chatMessageText(userMessage).trim() : ''
-
-      if (!userMessage || !userText) {
-        return
-      }
-
-      const targetAssistant =
-        parentId && messages[parentIndex]?.role === 'assistant'
-          ? messages[parentIndex]
-          : messages.slice(userIndex + 1).find(m => m.role === 'assistant')
-
-      const branchGroupId = targetAssistant?.branchGroupId ?? branchGroupForUser(userMessage)
-      const truncateOrdinal = visibleUserOrdinal(messages, userIndex)
-
-      update(current => {
-        const nextUserIndex = current.messages.findIndex((m, i) => i > userIndex && m.role === 'user')
-        const end = nextUserIndex < 0 ? current.messages.length : nextUserIndex
-
-        return {
-          ...current,
-          busy: true,
-          awaitingResponse: true,
-          pendingBranchGroup: branchGroupId,
-          sawAssistantPayload: false,
-          interrupted: false,
-          messages: [
-            ...current.messages.slice(0, userIndex + 1),
-            ...current.messages
-              .slice(userIndex + 1, end)
-              .map(m => (m.role === 'assistant' ? { ...m, branchGroupId, hidden: true } : m))
-          ]
-        }
-      })
+      update(current => applyReloadOptimistic(current, plan))
 
       try {
         await requestGateway(
           'prompt.submit',
-          { session_id: runtimeIdRef.current, text: userText, truncate_before_user_ordinal: truncateOrdinal },
+          { session_id: runtimeIdRef.current, text: plan.text, truncate_before_user_ordinal: plan.truncateOrdinal },
           PROMPT_SUBMIT_REQUEST_TIMEOUT_MS
         )
       } catch (err) {
@@ -344,30 +278,7 @@ export function useSessionTileActions({ runtimeId, scope, storedSessionId }: Ses
     async (messageId: string, target?: { text?: string; userOrdinal?: number | null }) => {
       const sessionId = runtimeIdRef.current
       const messages = readMessages()
-      const idIndex = messages.findIndex(m => m.id === messageId && m.role === 'user')
-
-      const fallbackIndex =
-        target?.userOrdinal === null || target?.userOrdinal === undefined
-          ? -1
-          : visibleUserIndexAtOrdinal(messages, target.userOrdinal)
-
-      const sourceIndex = idIndex >= 0 ? idIndex : fallbackIndex
-      const source = messages[sourceIndex]
-
-      if (!source || source.role !== 'user') {
-        throw new Error('Could not find the message to restore.')
-      }
-
-      const text = (chatMessageText(source).trim() || target?.text?.trim() || '').trim()
-
-      if (!text) {
-        throw new Error('Cannot restore an empty message.')
-      }
-
-      const truncateOrdinal =
-        target?.userOrdinal === null || target?.userOrdinal === undefined
-          ? visibleUserOrdinal(messages, sourceIndex)
-          : target.userOrdinal
+      const plan = planRestore(messages, messageId, target)
 
       clearSessionTodos(sessionId)
       resetSessionBackground(sessionId)
@@ -375,18 +286,10 @@ export function useSessionTileActions({ runtimeId, scope, storedSessionId }: Ses
 
       const wasBusy = readState()?.busy ?? false
 
-      update(state => ({
-        ...state,
-        busy: true,
-        awaitingResponse: true,
-        pendingBranchGroup: null,
-        sawAssistantPayload: false,
-        interrupted: false,
-        messages: state.messages.slice(0, sourceIndex + 1)
-      }))
+      update(state => applyRewindOptimistic(state, plan.sourceIndex))
 
       try {
-        await submitRewind(text, truncateOrdinal, wasBusy)
+        await submitRewind(plan.text, plan.truncateOrdinal, wasBusy)
       } catch (err) {
         update(state => ({ ...state, busy: false, awaitingResponse: false, messages }))
         throw err
@@ -397,29 +300,14 @@ export function useSessionTileActions({ runtimeId, scope, storedSessionId }: Ses
 
   const editMessage = useCallback(
     async (edited: AppendMessage) => {
-      const sourceId = edited.sourceId || edited.parentId
-
-      const text = edited.content
-        .map(part => (part.type === 'text' ? part.text : ''))
-        .join('')
-        .trim()
-
-      if (!sourceId || !text || edited.role !== 'user') {
-        return
-      }
-
       const messages = readMessages()
-      const sourceIndex = messages.findIndex(m => m.id === sourceId)
-      const source = messages[sourceIndex]
+      const plan = planEdit(messages, edited)
 
-      if (!source || source.role !== 'user' || chatMessageText(source).trim() === text) {
+      if (!plan) {
         return
       }
 
       const sessionId = runtimeIdRef.current
-      const nextMessage = messages[sourceIndex + 1]
-      const isFailedTurn = nextMessage?.role === 'assistant' && Boolean(nextMessage.error)
-      const editedMessage: ChatMessage = { ...source, parts: [textPart(text)] }
 
       clearSessionTodos(sessionId)
       resetSessionBackground(sessionId)
@@ -427,18 +315,10 @@ export function useSessionTileActions({ runtimeId, scope, storedSessionId }: Ses
 
       const wasBusy = readState()?.busy ?? false
 
-      update(state => ({
-        ...state,
-        busy: true,
-        awaitingResponse: true,
-        pendingBranchGroup: null,
-        sawAssistantPayload: false,
-        interrupted: false,
-        messages: [...state.messages.slice(0, sourceIndex), editedMessage]
-      }))
+      update(state => applyRewindOptimistic(state, plan.sourceIndex, plan.editedMessage))
 
       try {
-        await submitRewind(text, isFailedTurn ? undefined : visibleUserOrdinal(messages, sourceIndex), wasBusy)
+        await submitRewind(plan.text, plan.truncateOrdinal, wasBusy)
       } catch (err) {
         update(state => ({ ...state, busy: false, awaitingResponse: false, messages }))
         notifyError(err, copy.editFailed)
@@ -449,31 +329,7 @@ export function useSessionTileActions({ runtimeId, scope, storedSessionId }: Ses
 
   // Branch-visibility sync (assistant-ui hides non-active branches).
   const handleThreadMessagesChange = useCallback(
-    (nextMessages: readonly ThreadMessage[]) => {
-      const visibleIds = new Set(nextMessages.map(m => m.id))
-
-      update(state => {
-        let changed = false
-
-        const messages = state.messages.map(message => {
-          if (message.role !== 'assistant' || !message.branchGroupId) {
-            return message
-          }
-
-          const hidden = !visibleIds.has(message.id)
-
-          if (message.hidden === hidden) {
-            return message
-          }
-
-          changed = true
-
-          return { ...message, hidden }
-        })
-
-        return changed ? { ...state, messages } : state
-      })
-    },
+    (nextMessages: readonly ThreadMessage[]) => update(state => applyBranchVisibility(state, nextMessages)),
     [update]
   )
 
